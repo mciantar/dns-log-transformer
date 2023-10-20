@@ -6,12 +6,30 @@ import jsonschema
 import json
 import os
 import logging.handlers
+import random
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(2)  # Adjust the number of threads as needed
 
 logging.basicConfig(level=logging.INFO)
+
+def setup_syslog_logging():
+    syslog_server = '172.31.1.18'
+    syslog_port = 514  # Default syslog UDP port
+
+    # Set up the SysLogHandler without a formatter
+    syslog_handler = logging.handlers.SysLogHandler(address=(syslog_server, syslog_port),
+                                                    facility=logging.handlers.SysLogHandler.LOG_DAEMON)
+
+    # Create and configure a dedicated logger for DNS queries
+    dns_logger = logging.getLogger('dns_query_logger')
+    dns_logger.addHandler(syslog_handler)
+    dns_logger.setLevel(logging.INFO)
+
+    return dns_logger
+
+dns_logger = setup_syslog_logging()
 
 # Schema definition based on the provided YAML
 request_schema = {
@@ -132,12 +150,15 @@ class DNSQuery:
         syslog_timestamp = dt.strftime("%b %d %H:%M:%S")
         bind9_timestamp = dt.strftime("%d-%b-%Y %H:%M:%S.000")
 
+        # Generate a random 12-character hex value
+        random_hex = "@0x{:012x}".format(random.randint(0, 0xFFFFFFFFFFFF))
+
         # Extract the first answer's type if available, otherwise use a placeholder
         query_type = self.answers[0]['Type'] if self.answers else "A"
 
         # Construct the query log entry
-        query_log_entry = f"{syslog_timestamp} {self.vpc_id} route53resolver: {bind9_timestamp} client " \
-                          f"{self.srcaddr}#{self.srcport}: query: {self.query_name} IN {query_type} + (127.0.0.1)"
+        query_log_entry = f"{syslog_timestamp} {self.vpc_id} route53resolver: {bind9_timestamp} client {random_hex} " \
+                          f"{self.srcaddr}#{self.srcport} ({self.query_name}): query: {self.query_name} IN {query_type} + (127.0.0.1)"
 
         log_entries = [query_log_entry]
 
@@ -145,35 +166,69 @@ class DNSQuery:
         if self.answers:
             for answer in self.answers:
                 rdata = answer.get('Rdata', 'N/A')
-                reply_log_entry = f"{syslog_timestamp} {self.vpc_id} route53resolver: {bind9_timestamp} client " \
-                                  f"{self.srcaddr}#{self.srcport}: reply: {self.query_name} is {rdata}"
+                reply_log_entry = f"{syslog_timestamp} {self.vpc_id} route53resolver: {bind9_timestamp} client {random_hex} " \
+                                  f"{self.srcaddr}#{self.srcport} ({self.query_name}): reply: {self.query_name} is {rdata}"
                 log_entries.append(reply_log_entry)
 
         return "\n".join(log_entries)
 
-def setup_syslog_logging():
-    syslog_server = '172.31.1.18'
-    syslog_port = 514  # Default syslog UDP port
+def is_valid_dns_data(dns_data):
+    """Check if the parsed DNS data has the expected structure and types."""
+    required_keys = {
+        'version': str,
+        'account_id': str,
+        'region': str,
+        'vpc_id': str,
+        'query_timestamp': str,
+        'query_name': str,
+        'query_type': str,
+        'query_class': str,
+        'rcode': str,
+        'answers': list,
+        'srcaddr': str,
+        'srcport': str,
+        'transport': str,
+        'srcids': dict
+    }
 
-    # Set up the SysLogHandler without a formatter
-    syslog_handler = logging.handlers.SysLogHandler(address=(syslog_server, syslog_port),
-                                                    facility=logging.handlers.SysLogHandler.LOG_SYSLOG)
+    for key, expected_type in required_keys.items():
+        if key not in dns_data:
+            logging.error(f"Missing key in DNS data: {key}")
+            return False
+        if not isinstance(dns_data[key], expected_type):
+            logging.error(f"Invalid type for '{key}'. Expected {expected_type.__name__}.")
+            return False
 
-    # Add the handler to your logger
-    logger = logging.getLogger()
-    logger.addHandler(syslog_handler)
-    logger.setLevel(logging.DEBUG)
+    # Additional checks for nested structures
+    if 'answers' in dns_data:
+        for answer in dns_data['answers']:
+            if not isinstance(answer, dict):
+                logging.error("Each answer should be a dictionary.")
+                return False
+            if 'Rdata' not in answer or 'Type' not in answer:
+                logging.error("Missing 'Rdata' or 'Type' in answer.")
+                return False
 
-    return logger
+    if 'srcids' in dns_data:
+        if 'instance' not in dns_data['srcids']:
+            logging.error("Missing 'instance' in srcids.")
+            return False
+
+    return True
 
 def process_data(records):
     for record in records:
         try:
             decoded_data = base64.b64decode(record['data']).decode('utf-8')
-            # logging.info(f"Decoded data: {decoded_data}")
+            logging.info(f"Decoded data: {decoded_data}")
 
             # Parse the JSON data
             dns_data = json.loads(decoded_data)
+
+            # Validate the structure of the parsed data
+            if not is_valid_dns_data(dns_data):
+                logging.error("Invalid DNS data structure.")
+                continue  # Skip processing this record
 
             # Create a DNSQuery object
             dns_query = DNSQuery(
@@ -193,17 +248,19 @@ def process_data(records):
                 srcids=dns_data['srcids']
             )
 
-            logger = setup_syslog_logging()
             log_entries = dns_query.to_bind9_log_format().split('\n')
             for entry in log_entries:
-                logger.info(entry)
+                dns_logger.info(entry)
 
-            # Log the data in the Bind9 DNS log format
-            # logging.info(dns_query.to_bind9_log_format())
-
+        except (base64.binascii.Error, UnicodeDecodeError):
+            logging.error("Error decoding base64 data.")
+        except json.JSONDecodeError:
+            logging.error("Error parsing JSON data.")
+        except KeyError as e:
+            logging.error(f"Missing key in data: {str(e)}")
         except Exception as e:
-            logging.error(f"Error processing data: {str(e)}")
-
+            # For unexpected exceptions, log the type but not the full message in production
+            logging.error(f"Unexpected error of type {type(e).__name__} occurred.")
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -220,4 +277,4 @@ def internal_server_error(error):
 
 #if __name__ == '__main__':
 app.run(threaded=True, host="0.0.0.0", port=int(os.getenv("SERVICE_PORT")))
-#    app.run(threaded=True, host="0.0.0.0", port=5000)
+    #app.run(threaded=True, host="0.0.0.0", port=5000)
